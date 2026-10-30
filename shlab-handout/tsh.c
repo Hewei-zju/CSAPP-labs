@@ -84,8 +84,13 @@ void unix_error(char *msg);
 void app_error(char *msg);
 typedef void handler_t(int);
 handler_t *Signal(int signum, handler_t *handler);
+void sio_error(char s[]);
+ssize_t sio_putl(long v);
+ssize_t sio_puts(char s[]);
+static size_t sio_strlen(char s[]);
+static void sio_reverse(char s[]);
 
-int validID(char **argv,char *id,int &mode); 
+int validID(char **argv,char *id,int *mode); 
 
 
 /*
@@ -169,10 +174,29 @@ int main(int argc, char **argv)
 void eval(char *cmdline) 
 {
     char *argv[MAXARGS];
-    parseline(cmdline,argv);
-    initjobs(jobs);
+    int bg = parseline(cmdline,argv);
+    pid_t pid;
+    sigset_t mask,pre_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask,SIGCHLD);
     if (argv[0] && !builtin_cmd(argv)) {
-
+        sigprocmask(SIG_BLOCK,&mask,&pre_mask);
+        if ((pid = fork()) == 0) {
+            sigprocmask(SIG_SETMASK,&pre_mask,NULL);
+            setpgid(0,0);
+            execve(argv[0],argv,environ);
+            printf("%s: Command not found\n",argv[0]);
+            exit(1);
+        }
+        if (bg) {
+            addjob(jobs,pid,BG,cmdline);
+            printf("[%d] (%d) %s",pid2jid(pid),pid,cmdline);
+            sigprocmask(SIG_SETMASK,&pre_mask,NULL);
+        }else {
+            addjob(jobs,pid,FG,cmdline);
+            sigprocmask(SIG_SETMASK,&pre_mask,NULL);
+            waitfg(pid);
+        }
     }
     return;
 }
@@ -261,21 +285,23 @@ void do_bgfg(char **argv)
 {
     char *id = argv[1];
     int id_mode = 0;// 0:pid 1:jid
-    int id_num = validID(argv,id,&id_mode);
+    int id_num = validID(argv,id, &id_mode);
     if (id_num) {
         struct job_t *job = (id_mode) ? getjobjid(jobs,id_num) : getjobpid(jobs,(pid_t)id_num);
         if (!job) {
             if (id_mode) printf("%s: No such job\n",argv[1]);
-            else printf("%s: No such process\n",argv[1]);
+            else printf("(%s): No such process\n",argv[1]);
             return;
         }
         if (!strcmp(argv[0],"bg")) {
             job->state = BG;
             kill(-job->pid,SIGCONT);
+            printf("[%d] (%d) %s",job->jid,job->pid,job->cmdline);
         }else {
             //fg
             job->state = FG;
             kill(-job->pid,SIGCONT);
+            // printf("[%d] (%d) %s",job->jid,job->pid,job->cmdline);
             waitfg(job->pid);
         }
     }
@@ -289,24 +315,24 @@ void do_bgfg(char **argv)
  * return int id_num if yes and change mode jid/pid.
  * return 0 and print something otherwise.
  */
-int validID(char **argv,char *id, int &mode) {
+int validID(char **argv,char *id, int *mode) {
     if (!id) {
         printf("%s command requires PID or %%jobid argument\n",argv[0]);
         return 0;
     }
     char *end;
-    if (id == '%%') {
-        int id_num = strtoi(id[1],end,10);
+    if (id[0] == '%') {
+        int id_num = (int)strtol(id+1,&end,10);
         if (*end != '\0') {
-            printf("%s: No such job\n",argv[0]);
+            printf("%s: argument must be a PID or %%jobid\n",argv[0]);
         }else {
-            mode = 1;
+            *mode = 1;
             return id_num;
         }
     }else {
-        int id_num = strtoi(id,end,10);
+        int id_num = (int)strtol(id,&end,10);
         if (*end != '\0') {
-            printf("%s: No such process\n",argv[0]);
+            printf("%s: argument must be a PID or %%jobid\n",argv[0]);
         }else {
             mode = 0;
             return id_num;
@@ -319,7 +345,9 @@ int validID(char **argv,char *id, int &mode) {
  */
 void waitfg(pid_t pid)
 {
-    
+    while(fgpid(jobs) == pid) {
+        sleep(1);
+    }
 }
 
 /*****************
@@ -335,7 +363,45 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
-    return;
+    int old_errno = errno;
+    pid_t pid;
+    int status;
+    sigset_t mask,pre_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask,SIGINT);
+    sigaddset(&mask,SIGTSTP);
+    sigprocmask(SIG_BLOCK,&mask,&pre_mask);
+    while((pid = waitpid(-1,&status,WNOHANG | WUNTRACED)) > 0) {
+        if (WIFEXITED(status)) {
+            deletejob(jobs,pid);
+        }else if(WIFSIGNALED(status)) {
+            //print : Job [~] terminated by signal ~
+            sio_puts("Job [");
+            sio_putl((long)(pid2jid(pid)));
+            sio_puts("] (");
+            sio_putl((long)(pid));
+            sio_puts(") terminated by signal ");
+            sio_putl((long)(WTERMSIG(status)));
+            sio_puts("\n");
+            deletejob(jobs,pid);
+        }else if (WIFSTOPPED(status)) {
+            struct job_t *job;
+            if ((job = getjobpid(jobs,pid)) != NULL) {
+                job->state = ST;
+                sio_puts("Job [");
+                sio_putl((long)(pid2jid(pid)));
+                sio_puts("] (");
+                sio_putl((long)(pid));
+                sio_puts(") stopped by signal ");
+                sio_putl((long)(WSTOPSIG(status)));
+                sio_puts("\n");
+            }else {
+                sio_puts("No such job");
+            }
+        }
+    }
+    sigprocmask(SIG_SETMASK,&pre_mask,NULL);
+    errno = old_errno;
 }
 
 /* 
@@ -345,6 +411,18 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
+    int old_errno = errno;
+    pid_t pid;
+    sigset_t mask,pre_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask,SIGCHLD);
+    sigaddset(&mask,SIGTSTP);
+    sigprocmask(SIG_BLOCK,&mask,&pre_mask);
+    if ((pid = fgpid(jobs)) > 0) {
+        if(kill(-pid,sig) == -1) sio_puts("Signal sent failed\n");
+    }
+    sigprocmask(SIG_SETMASK,&pre_mask,NULL);
+    errno = old_errno;
     return;
 }
 
@@ -355,6 +433,18 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
+    int old_errno = errno;
+    pid_t pid;
+    sigset_t mask,pre_mask;
+    sigemptyset(&mask);
+    sigaddset(&mask,SIGCHLD);
+    sigaddset(&mask,SIGINT);
+    sigprocmask(SIG_BLOCK,&mask,&pre_mask);
+    if ((pid = fgpid(jobs)) > 0) {
+        if(kill(-pid,sig) == -1) sio_puts("Signal sent failed\n");
+    }
+    sigprocmask(SIG_SETMASK,&pre_mask,NULL);
+    errno = old_errno;
     return;
 }
 
@@ -577,5 +667,76 @@ void sigquit_handler(int sig)
     exit(1);
 }
 
+
+/*
+ * helper function from csapp.h
+ */
+/* Private sio functions */
+
+/* $begin sioprivate */
+/* sio_reverse - Reverse a string (from K&R) */
+static void sio_reverse(char s[])
+{
+    int c, i, j;
+
+    for (i = 0, j = strlen(s)-1; i < j; i++, j--) {
+        c = s[i];
+        s[i] = s[j];
+        s[j] = c;
+    }
+}
+
+/* sio_ltoa - Convert long to base b string (from K&R) */
+static void sio_ltoa(long v, char s[], int b) 
+{
+    int c, i = 0;
+    int neg = v < 0;
+
+    if (neg)
+	v = -v;
+
+    do {  
+        s[i++] = ((c = (v % b)) < 10)  ?  c + '0' : c - 10 + 'a';
+    } while ((v /= b) > 0);
+
+    if (neg)
+	s[i++] = '-';
+
+    s[i] = '\0';
+    sio_reverse(s);
+}
+
+/* sio_strlen - Return length of string (from K&R) */
+static size_t sio_strlen(char s[])
+{
+    int i = 0;
+
+    while (s[i] != '\0')
+        ++i;
+    return i;
+}
+/* $end sioprivate */
+
+/* Public Sio functions */
+/* $begin siopublic */
+
+ssize_t sio_puts(char s[]) /* Put string */
+{
+    return write(STDOUT_FILENO, s, sio_strlen(s)); //line:csapp:siostrlen
+}
+
+ssize_t sio_putl(long v) /* Put long */
+{
+    char s[128];
+    
+    sio_ltoa(v, s, 10); /* Based on K&R itoa() */  //line:csapp:sioltoa
+    return sio_puts(s);
+}
+
+void sio_error(char s[]) /* Put error message and exit */
+{
+    sio_puts(s);
+    _exit(1);                                      //line:csapp:sioexit
+}
 
 
