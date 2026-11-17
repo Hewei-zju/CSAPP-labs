@@ -17,6 +17,9 @@ ssize_t str_cat(char *bf,size_t s,char **strs,size_t n);
 int parse_URL(char *url,URLinfo* info);
 int parse_request_line(char *bf,char *URL);
 int Memcpy(char *dest,size_t s, char *src, size_t n);
+void *thread(void *vargp);
+
+
 
 int parse_URL(char *url,URLinfo* info) {
     char *host = strstr(url,"http://");
@@ -85,18 +88,22 @@ int main(int argc,char **argv)
         perror("Listenfd open failed");
         return 1;
     }
+    struct sockaddr_in client_sockaddr;
+    int *connfdp;
+    pthread_t tid;
     while(1) {
-        struct sockaddr_in client_sockaddr;
-        int connfd;
+        connfdp = Malloc(sizeof(int));
         socklen_t addrlen = sizeof(struct sockaddr_in);
-        if ((connfd = accept(listen_fd,(struct sockaddr *)&client_sockaddr,&addrlen)) == -1) {
+        if ((*connfdp = accept(listen_fd,(struct sockaddr *)&client_sockaddr,&addrlen)) == -1) {
             perror("Connect fd failed");
+            free(connfdp);
             continue;
         }
-        if (client_handler(connfd) < 0) {
-            fprintf(stderr,"client failed\n");
-        }
-        close(connfd);
+        Pthread_create(&tid,NULL,thread,connfdp);
+        // if (client_handler(connfd) < 0) {
+        //     fprintf(stderr,"client failed\n");
+        // }
+        // close(connfd);
     }
     close(listen_fd);
     return 0;
@@ -137,7 +144,7 @@ int client_handler(int connfd) {
         return -1;
     }
     //send request line
-    if (rio_writen(serverfd,bf,n) < 0) {
+    if (rio_writen(serverfd,bf,strlen(bf)) < 0) {
         perror("rio_writen:");
         goto cleanup;
     }
@@ -264,4 +271,15 @@ int Memcpy(char *dest, size_t s, char *src, size_t n) {
     memcpy(dest,src,n);
     dest[n] = '\0';
     return 0;
+}
+
+void *thread(void *vargp) {
+    Pthread_detach(Pthread_self());
+    int connfd = *(int *)vargp;
+    free(vargp);
+    if (client_handler(connfd) < 0) {
+        fprintf(stderr,"Client failed\n");
+    }
+    close(connfd);
+    return NULL;
 }
