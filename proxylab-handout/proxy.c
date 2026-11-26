@@ -1,8 +1,7 @@
 #include <stdio.h>
 #include "csapp.h"
-/* Recommended max cache and object sizes */
-#define MAX_CACHE_SIZE 1049000
-#define MAX_OBJECT_SIZE 102400
+#include "cache.h"
+
 
 /* You won't lose style points for including this long line in your code */
 static const char *user_agent_hdr = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:10.0.3) Gecko/20120305 Firefox/10.0.3\r\n";
@@ -91,6 +90,7 @@ int main(int argc,char **argv)
     struct sockaddr_in client_sockaddr;
     int *connfdp;
     pthread_t tid;
+    init_cache();
     while(1) {
         connfdp = Malloc(sizeof(int));
         socklen_t addrlen = sizeof(struct sockaddr_in);
@@ -133,6 +133,29 @@ int client_handler(int connfd) {
     URLinfo info;
     if (parse_URL(URL,&info) < 0) {
         return -1;
+    }
+    //if url exist in cache
+    char cache_buf[MAX_OBJECT_SIZE];
+    ssize_t cache_read;
+    if ((cache_read = hit_cache(cache_buf,URL)) != -1) {
+        fprintf(stdout,"Cache hit in proxy\n");
+        //read and ignore the rest content
+        while((n = rio_readlineb(&client_rp,bf,MAXLINE)) > 0) {
+            if (strcmp(bf,"\r\n") == 0) break;
+        }
+        if(n == -1) {
+            perror("rio_read:");
+            return -1;
+        }else if(n==0) {
+            fprintf(stderr,"Unexpected EOF in request\n");
+            return -1;
+        }
+        //send the cache data
+        if (rio_writen(connfd,cache_buf,cache_read) < 0) {
+            perror("rio_writen:");
+            return -1;
+        }
+        return 0;
     }
     char *strs[] = {"GET ",info.path," HTTP/1.0\r\n"};
     if (str_cat(bf,sizeof(bf),strs,3) < 0) {
@@ -220,6 +243,8 @@ int client_handler(int connfd) {
     fprintf(stdout,"Received request from client and send it to server\n");
     //wait for answer from server
     char server_buf[MAXLINE];
+    size_t cache_size = 0;
+    int out_of_cache = 0;
     rio_t server_rp;
     rio_readinitb(&server_rp,serverfd);
     while((n = rio_readnb(&server_rp,server_buf,sizeof(server_buf))) > 0) {
@@ -227,10 +252,19 @@ int client_handler(int connfd) {
             perror("rio_write:");
             goto cleanup;
         }
+        if (out_of_cache == 0 && cache_size + n <= MAX_OBJECT_SIZE) {
+            memcpy(cache_buf+cache_size,server_buf,n);
+            cache_size += n;
+        }else {
+            out_of_cache = 1;
+        }
     }
     if (n < 0) {
         perror("rio_read:");
         goto cleanup;
+    }
+    if (out_of_cache == 0) {
+        save_cache(URL,cache_buf,cache_size);
     }
     close(serverfd);
     return 0;
