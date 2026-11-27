@@ -70,14 +70,19 @@ int main(int argc, char *argv[])
     //cache stimulate
     init_cache(s,E,b);
     FILE *fp = fopen(tracefile,"r");
+    if (fp == NULL) {
+        perror("fopen:");
+        return 1;
+    }
     char op;
     uint64_t addr;
     int size;
     while(fscanf(fp, " %c %" SCNx64 ",%d", &op, &addr, &size) == 3) {
         if (Operate(op,addr) != 0) {
             fprintf(stdout,"op failed\n");
+            free(cache.cachelines);
             fclose(fp);
-            return 0;
+            return 1;
         }
     }
     if (verbose == 1) {
@@ -98,6 +103,10 @@ void init_cache(int s,int E,int b) {
     cache.lines_per_set = (size_t)E;
     cache.num_lines = cache.num_sets*cache.lines_per_set;
     cache.cachelines = malloc(sizeof(Cacheline)*cache.num_lines);
+    if (cache.cachelines == NULL) {
+        perror("malloc:");
+        exit(EXIT_FAILURE);
+    }
     size_t i;
     for (i = 0;i < cache.num_lines;i++) {
         cache.cachelines[i].valid_bit = 0;
@@ -114,7 +123,7 @@ int Operate(char op,uint64_t addr) {
         case 'L':
         case 'S':
             //store
-            load_cache(addr);
+            return load_cache(addr);
             break;
         case 'M':
             //modify
